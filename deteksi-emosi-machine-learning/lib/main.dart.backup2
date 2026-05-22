@@ -1,0 +1,249 @@
+// === SAME IMPORT ===
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:image/image.dart' as img;
+import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+const int REALTIME_SIZE = 96;
+const int CAPTURE_SIZE = 75;
+
+const String REALTIME_MODEL =
+    'assets/emotion_model_mobilenet_v2_96_data_final.tflite';
+const String CAPTURE_MODEL = 'assets/emotion_model.tflite';
+const String LABEL_PATH = 'assets/labels.txt';
+
+enum DetectMode { realtime, capture }
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: EmotionDetectorScreen(),
+    );
+  }
+}
+
+class EmotionDetectorScreen extends StatefulWidget {
+  const EmotionDetectorScreen({super.key});
+  @override
+  State<EmotionDetectorScreen> createState() => _EmotionDetectorScreenState();
+}
+
+class _EmotionDetectorScreenState extends State<EmotionDetectorScreen> {
+  CameraController? _camera;
+  List<CameraDescription> _cameras = [];
+
+  Interpreter? _rtInterpreter;
+  Interpreter? _capInterpreter;
+  List<String> _labels = [];
+
+  DetectMode _mode = DetectMode.realtime;
+  bool _busy = false;
+
+  String _emotion = "-";
+  double _confidence = 0.0;
+  XFile? _captured;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void dispose() {
+    _camera?.dispose();
+    _rtInterpreter?.close();
+    _capInterpreter?.close();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    await Permission.camera.request();
+    _labels = (await rootBundle.loadString(
+      LABEL_PATH,
+    )).split('\n').where((e) => e.isNotEmpty).toList();
+
+    _rtInterpreter = await Interpreter.fromAsset(REALTIME_MODEL);
+    _capInterpreter = await Interpreter.fromAsset(CAPTURE_MODEL);
+
+    _cameras = await availableCameras();
+    _camera = CameraController(
+      _cameras.firstWhere((c) => c.lensDirection == CameraLensDirection.front),
+      ResolutionPreset.low,
+      enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420,
+    );
+
+    await _camera!.initialize();
+    await _camera!.startImageStream(_onFrame);
+    setState(() {});
+  }
+
+  void _onFrame(CameraImage image) async {
+    if (_busy || _mode != DetectMode.realtime) return;
+    _busy = true;
+
+    final rgb = _yuvToRgb(image);
+    final resized = img.copyResize(
+      rgb,
+      width: REALTIME_SIZE,
+      height: REALTIME_SIZE,
+    );
+
+    final input = [_rgbTensor(resized, REALTIME_SIZE)];
+    final output = List.filled(
+      _labels.length,
+      0.0,
+    ).reshape([1, _labels.length]);
+
+    _rtInterpreter!.run(input, output);
+    _apply(output[0]);
+
+    _busy = false;
+  }
+
+  Future<void> _takePicture() async {
+    await _camera?.stopImageStream();
+
+    final file = await _camera!.takePicture();
+    _captured = file;
+
+    final raw = img.decodeImage(await File(file.path).readAsBytes())!;
+    final fixed = img.copyRotate(raw, angle: 90);
+    final gray = img.grayscale(fixed);
+    final resized = img.copyResize(
+      gray,
+      width: CAPTURE_SIZE,
+      height: CAPTURE_SIZE,
+    );
+
+    final input = [_grayTensor(resized, CAPTURE_SIZE)];
+    final output = List.filled(
+      _labels.length,
+      0.0,
+    ).reshape([1, _labels.length]);
+
+    _capInterpreter!.run(input, output);
+    _apply(output[0]);
+
+    setState(() {});
+  }
+
+  void _apply(List<double> p) {
+    final m = p.reduce((a, b) => a > b ? a : b);
+    setState(() {
+      _emotion = _labels[p.indexOf(m)].toUpperCase();
+      _confidence = m;
+    });
+  }
+
+  List _rgbTensor(img.Image img, int s) => List.generate(
+    s,
+    (y) => List.generate(s, (x) {
+      final p = img.getPixel(x, y);
+      return [p.r / 255, p.g / 255, p.b / 255];
+    }),
+  );
+
+  List _grayTensor(img.Image img, int s) => List.generate(
+    s,
+    (y) => List.generate(s, (x) => [img.getPixel(x, y).r / 255]),
+  );
+
+  img.Image _yuvToRgb(CameraImage image) {
+    final out = img.Image(width: image.width, height: image.height);
+    final y = image.planes[0].bytes;
+    final u = image.planes[1].bytes;
+    final v = image.planes[2].bytes;
+    final stride = image.planes[1].bytesPerRow;
+    final pix = image.planes[1].bytesPerPixel!;
+
+    for (int y0 = 0; y0 < image.height; y0++) {
+      for (int x0 = 0; x0 < image.width; x0++) {
+        final uv = (y0 ~/ 2) * stride + (x0 ~/ 2) * pix;
+        final yp = y[y0 * image.width + x0];
+        final up = u[uv];
+        final vp = v[uv];
+        out.setPixelRgb(
+          x0,
+          y0,
+          (yp + 1.402 * (vp - 128)).clamp(0, 255).toInt(),
+          (yp - 0.344 * (up - 128) - 0.714 * (vp - 128)).clamp(0, 255).toInt(),
+          (yp + 1.772 * (up - 128)).clamp(0, 255).toInt(),
+        );
+      }
+    }
+    return img.copyRotate(out, angle: 90);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_camera == null || !_camera!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    return Scaffold(
+      body: Stack(
+        children: [
+          Positioned.fill(
+            child: _mode == DetectMode.capture && _captured != null
+                ? Image.file(File(_captured!.path), fit: BoxFit.cover)
+                : CameraPreview(_camera!),
+          ),
+          Positioned(
+            bottom: 30,
+            left: 20,
+            right: 20,
+            child: Text(
+              "$_emotion (${(_confidence * 100).toStringAsFixed(1)}%)",
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white, fontSize: 26),
+            ),
+          ),
+          Positioned(
+            top: 40,
+            right: 20,
+            child: Column(
+              children: [
+                FloatingActionButton(
+                  onPressed: () async {
+                    if (_mode == DetectMode.realtime) {
+                      await _camera!.stopImageStream();
+                      setState(() => _mode = DetectMode.capture);
+                    } else {
+                      await _camera!.startImageStream(_onFrame);
+                      setState(() => _mode = DetectMode.realtime);
+                    }
+                  },
+                  child: Icon(
+                    _mode == DetectMode.realtime ? Icons.photo : Icons.videocam,
+                  ),
+                ),
+                if (_mode == DetectMode.capture)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 12),
+                    child: FloatingActionButton(
+                      backgroundColor: Colors.white,
+                      onPressed: _takePicture,
+                      child: const Icon(Icons.camera_alt, color: Colors.black),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

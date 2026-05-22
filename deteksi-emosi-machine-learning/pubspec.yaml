@@ -1,0 +1,28 @@
+name: frontend
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.8.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera:
+  permission_handler:
+  tflite_flutter: 
+  image:
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/emotion_model_mobilenet_v2_96_data_final.tflite
+    - assets/emotion_model_with_new_dataset.tflite
+    - assets/emotion_model.tflite
+    - assets/labels.txt
